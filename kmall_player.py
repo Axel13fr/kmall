@@ -39,13 +39,6 @@ class KmallPlayer:
         self.dg_counter = None
 
         self.MAX_DATAGRAM_SIZE = 64000
-        self.HEADER_STRUCT_FORMAT = '1I4s2B1H2I'
-        self.HEADER_STRUCT_SIZE = struct.calcsize(self.HEADER_STRUCT_FORMAT)
-        self.PART_STRUCT_SIZE = struct.calcsize("2H")
-        self.HEADER_AND_PART_SIZE =self.HEADER_STRUCT_SIZE + self.PART_STRUCT_SIZE
-        # A datagram is made of a header, a partition structure and the data, ended with a 4bytes
-        # integer which repeats the message size. The data part to split shall have a max length of:
-        self.MAX_DATA_SIZE = self.MAX_DATAGRAM_SIZE - self.HEADER_AND_PART_SIZE - 4
 
     @property
     def replay_timing(self):
@@ -94,6 +87,10 @@ class KmallPlayer:
         """
         f.seek(row['ByteOffset'], 0)
         sent = False
+        if row['MessageSize'] > self.MAX_DATAGRAM_SIZE:
+            logger.warning("Cannot send large datagrams as a single UDP packet. "
+                           "Consider using the split functionality of the KMALL package on your file")
+            return
         try:
             sent = self.sock_out.sendto(f.read(row['MessageSize']), (self.ip_out, self.port_out))
         except OSError as e:
@@ -113,73 +110,6 @@ class KmallPlayer:
             print("Datagrams transmitted: ", self.dg_counter)
             print("Closing file.")
             f.close()
-
-    @staticmethod
-    def read_header_raw(data) -> dict:
-        header = {}
-        format_to_unpack = "1I4s2B1H2I"
-        fields = struct.unpack(format_to_unpack, data[0:struct.calcsize(format_to_unpack)])
-        # Datagram length in bytes. The length field at the start (4 bytes) and end
-        # of the datagram (4 bytes) are included in the length count.
-        header['numBytesDgm'] = fields[0]
-        # Array of length 4. Multibeam datagram type definition, e.g. #AAA
-        header['dgmType'] = fields[1]
-        # Datagram version.
-        header['dgmVersion'] = fields[2]
-        # System ID. Parameter used for separating datagrams from different echosounders
-        # if more than one system is connected to SIS/K-Controller.
-        header['systemID'] = fields[3]
-        # Echo sounder identity, e.g. 122, 302, 710, 712, 2040, 2045, 850.
-        header['echoSounderID'] = fields[4]
-        # UTC time in seconds + Nano seconds remainder. Epoch 1970-01-01.
-        header['time_sec'] = fields[5]
-        header['time_nanosec'] = fields[6]
-        return header
-
-    @staticmethod
-    def update_header_with_dgm_size(header, new_size) -> bytes:
-        header['numBytesDgm'] = new_size
-        format_to_pack = "1I4s2B1H2I"
-        header_in_bytes = struct.pack(format_to_pack, header['numBytesDgm'], header['dgmType'],
-                    header['dgmVersion'], header['systemID'],
-                    header['echoSounderID'], header['time_sec'], header['time_nanosec'])
-        return header_in_bytes
-
-    def partition_msg(self, msg_to_split: bytes) -> []:
-        message_size = len(msg_to_split)
-        if message_size <= self.MAX_DATAGRAM_SIZE:
-            # No partitionning needed
-            return msg_to_split
-        else:
-            # Data to be split is only a subset of the datagram:
-            data_size = message_size - self.HEADER_AND_PART_SIZE - 4
-            numOfDgms = math.ceil(data_size / float(self.MAX_DATA_SIZE))
-            # Header from original message
-            header_dict = self.read_header_raw(msg_to_split[:self.HEADER_STRUCT_SIZE])
-            # Get the data content in the datagram and split it into smaller packs
-            data_to_split = msg_to_split[self.HEADER_AND_PART_SIZE:-4]
-
-            messages = []
-            # Partitions created in this loop will all have the max packet size of 64000
-            for i in range(numOfDgms - 1):
-                header = self.update_header_with_dgm_size(header_dict, self.MAX_DATAGRAM_SIZE)
-                # Partition index changes
-                part_struct = struct.pack("2H", numOfDgms, i+1)
-                split = data_to_split[i*self.MAX_DATA_SIZE:(i+1)*self.MAX_DATA_SIZE]
-                # Header + partition + data + message size repeated
-                m = bytearray(header) + bytearray(part_struct) + bytearray(split) \
-                    + bytearray(struct.pack('I', self.MAX_DATA_SIZE))
-                messages.append(m)
-
-            # Last partition  must contain the rest
-            rest_size = data_size % self.MAX_DATA_SIZE
-            header = self.update_header_with_dgm_size(header_dict, rest_size + self.HEADER_AND_PART_SIZE + 4)
-            part_struct = struct.pack("2H", numOfDgms, numOfDgms)
-            split = data_to_split[(numOfDgms - 1) * self.MAX_DATA_SIZE:]
-            m = header + part_struct + split + struct.pack('I', self.MAX_DATA_SIZE)
-            messages.append(m)
-
-            return messages
 
     def send_all_datagrams_rt(self, fp, df):
         """
@@ -204,9 +134,6 @@ class KmallPlayer:
             #         file.write(f.read(row['MessageSize']))
 
 
-            # TODO: Deal with large MRZs and MWCs..
-            #  For now, skip messages that are too big.
-
             # TODO: Busy waiting... Not ideal.
             # Wait for scheduled time:
             while row['ScheduledPlay'] > datetime.datetime.now():
@@ -224,17 +151,8 @@ class KmallPlayer:
                 if sent:
                     self.dg_counter += 1
             else:
-                messages = self.partition_msg(f.read(row['MessageSize']))
-                for m in messages:
-                    # Send datagram:
-                    try:
-                        sent = self.sock_out.sendto(m, (self.ip_out, self.port_out))
-                    except OSError as e:
-                        logger.warning("%s" % e)
-                    if sent:
-                        self.dg_counter += 1
-                logging.warning("Split message : size %s of type %s", str(row['MessageSize']), row['MessageType'])
-
+                logger.warning("Cannot send large datagrams as a single UDP packet. "
+                               "Consider using the split functionality (-s) of the KMALL package on your file.")
         print("Sent: ", self.dg_counter)
         f.close()
 
@@ -336,6 +254,7 @@ class KmallPlayer:
                     self.send_single_datagram(f, row, final_byteOffset)
                     if row['ScheduledDelay'] == 0:
                         now = datetime.datetime.now()
+
 
                 # Schedule positive delay datagrams
                 else:

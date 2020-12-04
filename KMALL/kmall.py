@@ -15,7 +15,7 @@ import os
 import re
 import bz2
 import copy
-from pyproj import Proj
+import math
 from scipy import stats
 
 
@@ -40,6 +40,16 @@ class kmall():
         self.datagram_data = None
         self.read_method = None
         self.eof = False
+
+        # According to KMALL documentation:
+        self.MAX_DATAGRAM_SIZE = 64000
+        self.HEADER_STRUCT_FORMAT = '1I4s2B1H2I'
+        self.HEADER_STRUCT_SIZE = struct.calcsize(self.HEADER_STRUCT_FORMAT)
+        self.PART_STRUCT_SIZE = struct.calcsize("2H")
+        self.HEADER_AND_PART_SIZE =self.HEADER_STRUCT_SIZE + self.PART_STRUCT_SIZE
+        # A datagram is made of a header, a partition structure and the data, ended with a 4bytes
+        # integer which repeats the message size. The data part to split shall have a max length of:
+        self.MAX_DATA_SIZE = self.MAX_DATAGRAM_SIZE - self.HEADER_AND_PART_SIZE - 4
 
     def __del__(self):
         if self.FID:
@@ -149,7 +159,7 @@ class kmall():
         # LMD tested.
 
         dg = {}
-        format_to_unpack = "1I4s2B1H2I"
+        format_to_unpack = self.HEADER_STRUCT_FORMAT
         self.header_size = struct.Struct(format_to_unpack).size
         fields = struct.unpack(format_to_unpack, self.FID.read(struct.Struct(format_to_unpack).size))
 
@@ -283,7 +293,7 @@ class kmall():
         dg['BISTStatus'] = fields[4]
 
         # Result of the BIST. Starts with a synopsis of the result, followed by detailed descriptions.
-        tmp = FID.read(dg['numBytesCmnPart'] - struct.Struct(format_to_unpack).size)
+        tmp = self.FID.read(dg['numBytesCmnPart'] - struct.Struct(format_to_unpack).size)
         bist_text = tmp.decode('UTF-8')
         # print(bist_text)
         dg['BISTText'] = bist_text
@@ -3351,6 +3361,10 @@ class kmall():
             self.FID.seek(offset, 0)
             header = self.read_EMdgmHeader()
             part = self.read_EMdgmMpartition()
+            if part['numOfDgms'] > 1:
+                raise ValueError("KMALL file contains partitionned messages, "
+                                 "reconstruction not handled: analysis cancelled!")
+
             dg = self.read_EMdgmMbody()
             self.pingcnt.append(dg['pingCnt'])
             self.rxFans.append(dg['rxFansPerPing'])
@@ -3445,10 +3459,12 @@ class kmall():
         pktSize = {}
         pktMinSize = {}
         pktMaxSize = {}
+        pkTotalCount = 0
         # Calculate some stats.
         for type in types:
             M = np.array(list(map(lambda x: x == type, self.msgtype)))
             pktcount[type] = sum(M)
+            pkTotalCount += pktcount[type]
             pktSize[type] = sum(self.msgsize[M])
             pktMinSize[type] = min(self.msgsize[M])
             pktMaxSize[type] = max(self.msgsize[M])
@@ -3462,6 +3478,7 @@ class kmall():
         IndexSummary = pd.DataFrame(summary)
 
         print(IndexSummary)
+        print("Total packets number: ", pkTotalCount)
 
     def _initialize_sequential_read(self, start_ptr, end_ptr):
         """
@@ -4003,6 +4020,84 @@ class kmall():
                 continue
         return [start_time, end_time]
 
+    @staticmethod
+    def read_header_raw(data) -> dict:
+        header = {}
+        format_to_unpack = "1I4s2B1H2I"
+        fields = struct.unpack(format_to_unpack, data[0:struct.calcsize(format_to_unpack)])
+        # Datagram length in bytes. The length field at the start (4 bytes) and end
+        # of the datagram (4 bytes) are included in the length count.
+        header['numBytesDgm'] = fields[0]
+        # Array of length 4. Multibeam datagram type definition, e.g. #AAA
+        header['dgmType'] = fields[1]
+        # Datagram version.
+        header['dgmVersion'] = fields[2]
+        # System ID. Parameter used for separating datagrams from different echosounders
+        # if more than one system is connected to SIS/K-Controller.
+        header['systemID'] = fields[3]
+        # Echo sounder identity, e.g. 122, 302, 710, 712, 2040, 2045, 850.
+        header['echoSounderID'] = fields[4]
+        # UTC time in seconds + Nano seconds remainder. Epoch 1970-01-01.
+        header['time_sec'] = fields[5]
+        header['time_nanosec'] = fields[6]
+        return header
+
+    @staticmethod
+    def update_header_with_dgm_size(header, new_size) -> bytes:
+        header['numBytesDgm'] = new_size
+        format_to_pack = "1I4s2B1H2I"
+        header_in_bytes = struct.pack(format_to_pack, header['numBytesDgm'], header['dgmType'],
+                    header['dgmVersion'], header['systemID'],
+                    header['echoSounderID'], header['time_sec'], header['time_nanosec'])
+        return header_in_bytes
+
+    def partition_msg(self, msg_to_split: bytes) -> []:
+        """
+        Takes a KMALL datagram in bytes and splits its specific data content into several messages with a guaranteed
+        maximum size of MAX_DATAGRAM_SIZE.
+        The resulting messages are regular constructed KMALL datagrams made of a Header structure,
+        a partition structure, a chunck of the original data content, terminated with a repetition of the datagram size.
+
+        Partitions originating from the same message share the same timestamp as done by Kongsberg hardware.
+
+        :param msg_to_split: KMALL datagram bytes containing the message to split
+        :return: an array of smaller messages
+        """
+
+        message_size = len(msg_to_split)
+        if message_size <= self.MAX_DATAGRAM_SIZE:
+            # No partitionning needed
+            return [msg_to_split]
+        else:
+            # Data to be split is only a subset of the datagram:
+            data_size = message_size - self.HEADER_AND_PART_SIZE - 4
+            numOfDgms = math.ceil(data_size / float(self.MAX_DATA_SIZE))
+            # Header from original message
+            header_dict = self.read_header_raw(msg_to_split[:self.HEADER_STRUCT_SIZE])
+            # Get the data content in the datagram and split it into smaller packs
+            data_to_split = msg_to_split[self.HEADER_AND_PART_SIZE:-4]
+
+            messages = []
+            # Partitions created in this loop will all have the max packet size of 64000
+            for i in range(numOfDgms - 1):
+                header = self.update_header_with_dgm_size(header_dict, self.MAX_DATAGRAM_SIZE)
+                # Partition index changes
+                part_struct = struct.pack("2H", numOfDgms, i+1)
+                split = data_to_split[i*self.MAX_DATA_SIZE:(i+1)*self.MAX_DATA_SIZE]
+                # Header + partition + data + message size repeated
+                m = bytearray(header) + bytearray(part_struct) + bytearray(split) \
+                    + bytearray(struct.pack('I', self.MAX_DATA_SIZE))
+                messages.append(m)
+
+            # Last partition  must contain the rest
+            rest_size = data_size % self.MAX_DATA_SIZE
+            header = self.update_header_with_dgm_size(header_dict, rest_size + self.HEADER_AND_PART_SIZE + 4)
+            part_struct = struct.pack("2H", numOfDgms, numOfDgms)
+            split = data_to_split[(numOfDgms - 1) * self.MAX_DATA_SIZE:]
+            m = header + part_struct + split + struct.pack('I', self.MAX_DATA_SIZE)
+            messages.append(m)
+
+            return messages
 
 def main(args=None):
     ''' Commandline script code.'''
@@ -4029,6 +4124,8 @@ def main(args=None):
                         default=False, help=("Decompress a file compressed with this library. " +
                                              "Files must end in .Lz, where L is an integer indicating " +
                                              "the compression level (set by -l when compresssing)"))
+    parser.add_argument('-s',action='store_true', dest='split', default=False,
+                        help="Rewrites the KMALL file with large datagrams split into partitions")
 
     parser.add_argument('-v', action='count', dest='verbose', default=0,
                         help="Increasingly verbose output (e.g. -v -vv -vvv),"
@@ -4043,6 +4140,7 @@ def main(args=None):
     compress = args.compress
     decompress = args.decompress
     compressionLevel = args.compressionLevel
+    split = args.split
 
     validCompressionLevels = [0, 1]
     if compressionLevel not in validCompressionLevels:
@@ -4083,6 +4181,27 @@ def main(args=None):
 
         # Index file (check for index)
         K.index_file()
+
+        # Rewrite with packet splits if requested.
+        if split:
+            filename_split = filename + ".split.kmall"
+            print("KMALL packets split will be written to : " + filename_split)
+            split_cnt = 0
+            with open(filename_split, 'wb') as file:
+                for offset, size, mtype in zip(K.Index['ByteOffset'],
+                                               K.Index['MessageSize'],
+                                               K.Index['MessageType']):
+                    K.FID.seek(offset, 0)
+                    datagram = K.FID.read(size)
+                    if size > K.MAX_DATAGRAM_SIZE:
+                        # split into smaller partitionned datagrams
+                        messages = K.partition_msg(datagram)
+                        split_cnt += 1
+                        for m in messages:
+                            file.write(m)
+                    else:
+                        file.write(datagram)
+            print("Split done on {} packets".format(split_cnt))
 
         ## Do packet verification if requested.
         pingcheckdata = []
